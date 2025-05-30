@@ -156,6 +156,7 @@ def main():
     g_args = args
     fixed_seed_point()
     device = torch.device(args.device)
+
     base = DiffusionPipeline.from_pretrained(
         args.pretrained_base,
         torch_dtype=torch.float16,
@@ -185,6 +186,13 @@ def main():
         
     if g_args.type == 'test':
         trick.replace_conv2d(base.unet)
+        do_test(
+            base=base,
+            calibration_prompts=load_calib_prompts(1, args.test_data),
+            n_steps=args.n_steps,
+            latent=init_latent,
+        )
+    if g_args.type == 'float':
         do_test(
             base=base,
             calibration_prompts=load_calib_prompts(1, args.test_data),
