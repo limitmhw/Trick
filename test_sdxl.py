@@ -111,7 +111,16 @@ def do_calibrate(base, calibration_prompts, **kwargs):
             guidance_scale=8.0,  # MLPerf requirements
         ).images
 
-    
+def fixed_seed_point():
+    import numpy
+    import random
+    seed = 0
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    numpy.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
 g_args = None
 def main():
     parser = argparse.ArgumentParser()
@@ -145,8 +154,8 @@ def main():
     args = parser.parse_args()
     global g_args
     g_args = args
+    fixed_seed_point()
     device = torch.device(args.device)
-
     base = DiffusionPipeline.from_pretrained(
         args.pretrained_base,
         torch_dtype=torch.float16,
