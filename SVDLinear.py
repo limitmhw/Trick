@@ -9,12 +9,14 @@ __all__ = ["SVDLinear"]
 
 class SVDLinear(nn.Module):
     def __init__(
-        self, linear: nn.Linear, rank: int):
+        self, linear: nn.Linear, rank: int, iters: int = 3, fake_quant_func: Callable = None):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         assert(rank > 0)
         self.rank = rank
+        self.iters = iters
+        self.fake_quant_func = fake_quant_func
         self.a, self.b, self.r = nn.Linear(self.in_features, rank, bias=False), nn.Linear(rank, self.out_features, bias=False), nn.Linear(self.in_features, self.out_features, bias=False)
         self.reset_parameters(linear.weight)
 
@@ -23,18 +25,28 @@ class SVDLinear(nn.Module):
         assert weight.ndim == 2, "LinearLoRAHook only supports 2D input tensor"
         device, dtype = weight.device, weight.dtype
         self.to(device=device, dtype=dtype)
-        u, s, vh = torch.linalg.svd(weight.double())
-        us = u[:, : self.rank] * s[: self.rank]
-        vh = vh[: self.rank:]
-        w_k = us @ vh
-        w_r = weight - w_k
-        assert not us.isnan().any(), "NaN in U * S"
-        assert not vh.isnan().any(), "NaN in V^T"
-        assert not us.isinf().any(), "Inf in U * S"
-        assert not vh.isinf().any(), "Inf in V^T"
-        self.a.weight.data.copy_(vh.to(dtype))
-        self.b.weight.data.copy_(us.to(dtype))
-        self.r.weight.data.copy_(w_r.to(dtype))
+        # Use double precision for SVD stability
+        orig_weight = weight.double()
+        # curr_weight represents the part of the weight not yet captured by the quantized residual
+        # by the quantized residual
+        curr_weight = orig_weight.clone()
+        for _ in range(self.iters):
+            
+            u, s, vh = torch.linalg.svd(curr_weight.double())
+            us = u[:, : self.rank] * s[: self.rank]
+            vh = vh[: self.rank:]
+            low_rank_weight = orig_weight - (us @ vh)
+            if self.fake_quant_func is not None:
+                low_rank_weight_quant = self.fake_quant_func(low_rank_weight)
+                curr_weight = orig_weight - low_rank_weight_quant
+            assert not us.isnan().any(), "NaN in U * S"
+            assert not vh.isnan().any(), "NaN in V^T"
+            assert not us.isinf().any(), "Inf in U * S"
+            assert not vh.isinf().any(), "Inf in V^T"
+
+            self.a.weight.data.copy_(vh.to(dtype))
+            self.b.weight.data.copy_(us.to(dtype))
+            self.r.weight.data.copy_(low_rank_weight_quant.to(dtype))
 
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
