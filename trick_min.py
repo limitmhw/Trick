@@ -128,8 +128,12 @@ def do_smooth_linear(model):
                 smooth_fcs(module, 1.0)
 
 calib_info = None
-       
+weight_only = False
+skip_pattern = None
+
 def filter_func(name):
+    if skip_pattern is not None:
+        return re.compile(skip_pattern).match(name) is not None
     pattern = re.compile(
         r".*(time_emb_proj|time_embedding|conv_in|conv_out|conv_shortcut|add_embedding).*"
     )
@@ -140,10 +144,10 @@ def quant_conv(module, *args, **kwargs):
     quant_min = -128
     quant_max = 128
     input_data = args[0]
-    input_scale =  (calib_info[module.module_name]["input"] /  quant_max).to(torch.float32)
-    zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
-    quant_input = torch.fake_quantize_per_tensor_affine(input_data, input_scale, zero_point, quant_min, quant_max)
-    # quant weight
+    if not weight_only:
+        input_scale =  (calib_info[module.module_name]["input"] /  quant_max).to(torch.float32)
+        zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
+        input_data = torch.fake_quantize_per_tensor_affine(input_data, input_scale, zero_point, quant_min, quant_max)
     if not hasattr(module, "org_weight"):
         weight_scale = (calib_info[module.module_name]["weight"] /  quant_max).to(torch.float32)
         zero_point = torch.zeros(weight_scale.shape).to(torch.int32).to(weight_scale.device)
@@ -151,7 +155,7 @@ def quant_conv(module, *args, **kwargs):
         setattr(module, "org_weight", module.weight)
         module.weight = torch.nn.Parameter(quant_weight) 
     args = list(args)
-    args[0] = quant_input
+    args[0] = input_data
     return module.org_forward(*args, **kwargs)
 
 def quant_linear(module, *args, **kwargs):
@@ -160,30 +164,24 @@ def quant_linear(module, *args, **kwargs):
     quant_max = 128
     input_data = args[0]
 
-    if "smoothquant_scale" in  calib_info[module.module_name].keys():
-        smoothquant_amax = torch.tensor(
-            (calib_info[module.module_name]["input"] * calib_info[module.module_name]["smoothquant_scale"]).max().item(),
-            dtype=module.weight.dtype,
-            device=module.weight.device,
-        )
-        input_scale =  (smoothquant_amax / quant_max).to(torch.float32)
-        zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
-        quant_input = torch.fake_quantize_per_tensor_affine(input_data * calib_info[module.module_name]["smoothquant_scale"], input_scale, zero_point, quant_min, quant_max)
-        if not hasattr(module, "smoothquant_weight"):
-            setattr(module, "smoothquant_weight", True)
-            module.weight = torch.nn.Parameter(module.weight / calib_info[module.module_name]["smoothquant_scale"]) #.unsqueeze(0))  ?????
-            calib_info[module.module_name]["weight"] = collect_min_max(module.weight, 0)
-    else:
-
-        # per channel
-        input_scale = (calib_info[module.module_name]["input"] /  quant_max).to(torch.float32)
-        zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
-        quant_input = torch.fake_quantize_per_channel_affine(input_data, input_scale.view(-1), zero_point.view(-1), 2, quant_min, quant_max)
-
-        # per tensor
-        # input_scale =  (calib_info[module.module_name]["input"].max() /  quant_max).to(torch.float32)
-        # zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
-        # quant_input = torch.fake_quantize_per_tensor_affine(input_data, input_scale, zero_point, quant_min, quant_max)
+    if not weight_only:
+        if "smoothquant_scale" in  calib_info[module.module_name].keys():
+            smoothquant_amax = torch.tensor(
+                (calib_info[module.module_name]["input"] * calib_info[module.module_name]["smoothquant_scale"]).max().item(),
+                dtype=module.weight.dtype,
+                device=module.weight.device,
+            )
+            input_scale =  (smoothquant_amax / quant_max).to(torch.float32)
+            zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
+            input_data = torch.fake_quantize_per_tensor_affine(input_data * calib_info[module.module_name]["smoothquant_scale"], input_scale, zero_point, quant_min, quant_max)
+            if not hasattr(module, "smoothquant_weight"):
+                setattr(module, "smoothquant_weight", True)
+                module.weight = torch.nn.Parameter(module.weight / calib_info[module.module_name]["smoothquant_scale"])
+                calib_info[module.module_name]["weight"] = collect_min_max(module.weight, 0)
+        else:
+            input_scale = (calib_info[module.module_name]["input"] /  quant_max).to(torch.float32)
+            zero_point = torch.zeros(input_scale.shape).to(torch.int32).to(input_scale.device)
+            input_data = torch.fake_quantize_per_channel_affine(input_data, input_scale.view(-1), zero_point.view(-1), 2, quant_min, quant_max)
 
     if not hasattr(module, "org_weight"):
         weight_scale = (calib_info[module.module_name]["weight"] /  quant_max).to(torch.float32)
@@ -192,7 +190,7 @@ def quant_linear(module, *args, **kwargs):
         setattr(module, "org_weight", module.weight)
         module.weight = torch.nn.Parameter(quant_weight) 
     args = list(args)
-    args[0] = quant_input
+    args[0] = input_data
     return module.org_forward(*args, **kwargs)
 
 def quant_forward(self, *args, **kwargs):
@@ -203,13 +201,120 @@ def quant_forward(self, *args, **kwargs):
         
 def replace_conv2d(model):
     global calib_info
-    calib_data_path = str(model.__class__.__name__) + "__calib.pt"
-    calib_info = torch.load(calib_data_path)
+    if calib_info is None:
+        calib_data_path = str(model.__class__.__name__) + "__calib.pt"
+        calib_info = torch.load(calib_data_path)
+        print(f"[Quant] Loaded calib_info from {calib_data_path}")
+    else:
+        print(f"[Quant] Using pre-loaded calib_info ({len(calib_info)} entries)")
     
+    quantized_layers = []
+    skipped_layers = []
     for name, module in model.named_modules():
         setattr(module, "module_name", name)
         if filter_func(name):
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                skipped_layers.append(name)
             continue
         if (isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear))  and not hasattr(module, "org_forward"):
             setattr(module, "org_forward", module.forward)
             module.forward = partial(quant_forward, module)
+            quantized_layers.append(name)
+
+    print(f"[Quant] Quantized layers: {len(quantized_layers)}")
+    print(f"[Quant] Skipped  layers: {len(skipped_layers)}")
+    if skipped_layers:
+        for skipped_name in skipped_layers:
+            print(f"  [SKIP] {skipped_name}")
+    for quantized_name in quantized_layers:
+        print(f"  [QUANT] {quantized_name}")
+    return quantized_layers
+
+
+@torch.no_grad()
+def export_quantized_model(model, export_path):
+    """Pre-quantize all hooked weights and save model state_dict + metadata.
+
+    Must be called after replace_conv2d() so forward hooks and calib_info are ready.
+
+    :param model: The model whose quantized layers will be exported.
+    :param str export_path: File path to save the exported checkpoint.
+    """
+    global calib_info
+    quant_min = -128
+    quant_max = 128
+    quantized_layer_names = []
+
+    for module_name, module in model.named_modules():
+        if not hasattr(module, "org_forward"):
+            continue
+        quantized_layer_names.append(module_name)
+
+        if isinstance(module, torch.nn.Linear) and not weight_only:
+            if module_name in calib_info and "smoothquant_scale" in calib_info[module_name]:
+                if not hasattr(module, "smoothquant_weight"):
+                    module.weight = torch.nn.Parameter(
+                        module.weight / calib_info[module_name]["smoothquant_scale"])
+                    calib_info[module_name]["weight"] = collect_min_max(module.weight, 0)
+                    setattr(module, "smoothquant_weight", True)
+
+        if not hasattr(module, "org_weight"):
+            weight_scale = (calib_info[module_name]["weight"] / quant_max).to(torch.float32)
+            zero_point = torch.zeros(weight_scale.shape, dtype=torch.int32, device=weight_scale.device)
+            quant_weight = torch.fake_quantize_per_channel_affine(
+                module.weight, weight_scale.view(-1), zero_point.view(-1), 0, quant_min, quant_max)
+            setattr(module, "org_weight", module.weight)
+            module.weight = torch.nn.Parameter(quant_weight)
+
+    clean_state_dict = {}
+    for param_name, param_value in model.state_dict().items():
+        if ".org_weight" in param_name:
+            continue
+        clean_state_dict[param_name] = param_value
+
+    exported_calib_info = {}
+    for layer_name in quantized_layer_names:
+        if layer_name in calib_info:
+            exported_calib_info[layer_name] = calib_info[layer_name]
+
+    torch.save({
+        "state_dict": clean_state_dict,
+        "quantized_layers": quantized_layer_names,
+        "calib_info": exported_calib_info,
+        "weight_only": weight_only,
+    }, export_path)
+    print(f"[Export] Saved {len(quantized_layer_names)} quantized layers "
+          f"+ calib_info ({len(exported_calib_info)} entries) to {export_path}")
+
+
+def load_quantized_model(model, export_path):
+    """Load pre-quantized weights, calib_info, and mark layers to skip re-quantization.
+
+    Must be called BEFORE replace_conv2d() so the org_weight guards take effect.
+    If the checkpoint contains calib_info, it is loaded into the global calib_info
+    so replace_conv2d() does not need to read the separate __calib.pt file.
+
+    :param model: The model to load quantized weights into.
+    :param str export_path: Path to the exported checkpoint.
+
+    :return: Set of quantized layer names from the checkpoint.
+    :rtype: set
+    """
+    global calib_info
+    checkpoint = torch.load(export_path, weights_only=False)
+    model.load_state_dict(checkpoint["state_dict"])
+    quantized_layer_set = set(checkpoint["quantized_layers"])
+
+    for module_name, module in model.named_modules():
+        if module_name in quantized_layer_set:
+            setattr(module, "org_weight", module.weight)
+            setattr(module, "smoothquant_weight", True)
+
+    if "calib_info" in checkpoint:
+        calib_info = checkpoint["calib_info"]
+        print(f"[Load] Restored calib_info ({len(calib_info)} entries) from checkpoint")
+
+    loaded_weight_only = checkpoint.get("weight_only", False)
+    print(f"[Load] Loaded {len(quantized_layer_set)} pre-quantized layers from {export_path}")
+    print(f"[Load] Checkpoint weight_only={loaded_weight_only}")
+    return quantized_layer_set
